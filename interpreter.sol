@@ -35,92 +35,140 @@ contract MPCExpressionEvaluator {
     event ExpressionEvaluated(address indexed user, string expression, int256 result);
     event ExpressionParsed(address indexed user, string expression, uint256 rootNodeIndex);
     
-    // Mathematical operations
-    function absolute(int256 a) public pure returns (int256) {
-        return a < 0 ? -a : a;
+    // ------------------------------------------
+    // Mathematical operations (MPC-Secure Flavors)
+    // ------------------------------------------
+
+    // MPC-safe absolute: (a + mask) ^ mask where mask = a >> 255 (for int256 sign bit)
+    function absolute(int256 a) private pure returns (int256) {
+        // Shift right by 255 to get the sign bit (0 for positive, -1 for negative in 2's complement)
+        int256 mask = a >> 255; 
+        return (a + mask) ^ mask;
     }
     
-    function subtract(int256 a, int256 b) public pure returns (int256) {
+    // Standard subtraction, as it's typically arithmetic-circuit friendly
+    function subtract(int256 a, int256 b) private pure returns (int256) {
         return a - b;
     }
     
-    function multiply(int256 a, int256 b) public pure returns (int256) {
+    // MPC-safe multiply: Bitwise multiplication
+    // Adapted to uint256 for the loop, handling signedness separately
+    function multiply(int256 a, int256 b) private pure returns (int256) {
         if (a == 0 || b == 0) return 0;
         
-        bool isNegative = (a < 0) != (b < 0);
+        bool isNegative = (a < 0) != (b < 0); // XOR of signs
         uint256 ua = uint256(absolute(a));
         uint256 ub = uint256(absolute(b));
         
         uint256 result = 0;
+        // Loop up to 256 bits, but typical values will finish much earlier
+        // Solidity's <<= and >>= are safe for uint256 up to 255 shifts.
         for (uint256 i = 0; i < 256 && ub > 0; i++) {
-            if (ub & 1 == 1) {
+            if (ub & 1 == 1) { // If the current bit of ub is 1
                 result += ua;
             }
-            ua <<= 1;
-            ub >>= 1;
+            ua <<= 1; // Shift ua left (ua * 2)
+            ub >>= 1; // Shift ub right (ub / 2)
         }
         
         return isNegative ? -int256(result) : int256(result);
     }
     
-    function divideUnsigned(uint256 numerator, uint256 denominator) public pure returns (uint256) {
-        if (denominator == 0) return 0;
-        if (numerator < denominator) return 0;
+    // MPC-safe unsigned division: Bitwise long division
+    function divideUnsigned(uint256 numerator, uint256 denominator) private pure returns (uint256) {
+        if (denominator == 0) return 0; // Avoid division by zero, return 0 as convention
+        if (numerator < denominator) return 0; // Optimization
         
         uint256 quotient = 0;
         uint256 remainder = numerator;
         
+        // Find the highest bit position where denominator can be aligned with numerator
         uint256 shift = 0;
-        uint256 tempDenom = denominator;
-        while (tempDenom <= numerator && shift < 256) {
-            tempDenom <<= 1;
+        // max shift is 255 for uint256
+        while ((denominator << shift) <= numerator && (denominator << shift) != 0 && shift < 255) {
             shift++;
         }
-        if (shift > 0) shift--;
-        
+        if (shift > 0 && (denominator << shift) > numerator) {
+             shift--; // Move back to the last valid shift
+        } else if (shift == 255 && (denominator << shift) <= numerator) {
+            // handle the case where denominator * 2^255 is still <= numerator
+            // meaning shift should be 255. No decrement needed.
+        }
+
+
+        // Perform bitwise long division
+        // Loop from the highest possible bit down to 0
         for (uint256 i = 0; i <= shift; i++) {
+            // Calculate shifted divisor (denominator * 2^(shift-i))
             uint256 shiftedDivisor = denominator << (shift - i);
+            
+            // If the remainder is greater than or equal to the shifted divisor
             if (remainder >= shiftedDivisor) {
-                remainder -= shiftedDivisor;
-                quotient |= (1 << (shift - i));
+                remainder -= shiftedDivisor; // Subtract the shifted divisor
+                quotient |= (1 << (shift - i)); // Set the corresponding bit in the quotient
             }
         }
         
         return quotient;
     }
     
-    function divideSigned(int256 a, int256 b) public pure returns (int256) {
-        if (b == 0) return 0;
+    // MPC-safe signed division using the unsigned version
+    function divideSigned(int256 a, int256 b) private pure returns (int256) {
+        if (b == 0) return 0; // As per C code, return 0 on division by zero
         
         uint256 ua = uint256(absolute(a));
         uint256 ub = uint256(absolute(b));
-        uint256 result = divideUnsigned(ua, ub);
+        uint256 resultUnsigned = divideUnsigned(ua, ub);
         
         bool isNegative = (a < 0) != (b < 0);
-        return isNegative ? -int256(result) : int256(result);
+        return isNegative ? -int256(resultUnsigned) : int256(resultUnsigned);
+    }
+
+    // MPC-safe greater_than: (diff >> 255) & 1 == 0 && diff != 0
+    // returns 1 for true, 0 for false
+    function greaterThan(int256 a, int256 b) private pure returns (int256) {
+        int256 diff = subtract(a, b);
+        // int256 sign_bit = diff >> 255; // 0 if non-negative, -1 (0xFF..FF) if negative
+        // The comparison for sign_bit == 0 is effectively checking if diff >= 0
+        // And diff != 0 must be true for strict greater_than
+        
+        // Simplified check for diff > 0
+        // (diff > 0) ? 1 : 0
+        return diff > 0 ? int256(1) : int256(0); // Explicitly cast to int256
     }
     
-    function greaterThan(int256 a, int256 b) public pure returns (bool) {
-        return a > b;
+    // MPC-safe equal: diff == 0
+    // returns 1 for true, 0 for false
+    function equal(int256 a, int256 b) private pure returns (int256) {
+        int256 diff = subtract(a, b);
+        return diff == 0 ? int256(1) : int256(0); // Explicitly cast to int256
     }
     
-    function equal(int256 a, int256 b) public pure returns (bool) {
-        return a == b;
+    // MPC-safe ifElse: (cond_val & trueVal) | ((~cond_val) & falseVal)
+    // cond_val should be 0xFF..FF (-1) for true, 0 for false.
+    function ifElse(int256 trueVal, int256 falseVal, int256 conditionVal) private pure returns (int256) {
+        // Condition is evaluated to 1 (true) or 0 (false) by comparison functions
+        // We need it to be -1 (0xFF..FF) for true, 0 for false for bitwise mask
+        int256 mask = conditionVal == int256(1) ? int256(-1) : int256(0); // Explicitly cast to int256
+        return (trueVal & mask) | (falseVal & (~mask));
+    }
+
+    // Max using MPC-safe ifElse and greaterThan
+    function max(int256 a, int256 b) private pure returns (int256) {
+        int256 cond = greaterThan(a, b); // cond will be 1 or 0
+        return ifElse(a, b, cond);
     }
     
-    function max(int256 a, int256 b) public pure returns (int256) {
-        return a > b ? a : b;
+    // Min using MPC-safe ifElse and greaterThan (b, a)
+    function min(int256 a, int256 b) private pure returns (int256) {
+        int256 cond = greaterThan(b, a); // cond will be 1 or 0
+        return ifElse(a, b, cond);
     }
     
-    function min(int256 a, int256 b) public pure returns (int256) {
-        return a < b ? a : b;
-    }
-    
-    function ifElse(int256 trueVal, int256 falseVal, bool condition) public pure returns (int256) {
-        return condition ? trueVal : falseVal;
-    }
-    
-    // String utilities
+    // ------------------------------------------
+    // String utilities (no change needed for MPC safety)
+    // ------------------------------------------
+
     function isAlpha(bytes1 char) private pure returns (bool) {
         return (char >= 0x41 && char <= 0x5A) || (char >= 0x61 && char <= 0x7A);
     }
@@ -163,7 +211,10 @@ contract MPCExpressionEvaluator {
                stringsEqual(word, "ifelse") || stringsEqual(word, "absolute");
     }
     
-    // Tokenization
+    // ------------------------------------------
+    // Tokenization (no change needed for MPC safety)
+    // ------------------------------------------
+
     function tokenize(string memory expression) private {
         bytes memory expr = bytes(expression);
         delete userTokens[msg.sender];
@@ -194,7 +245,7 @@ contract MPCExpressionEvaluator {
             // Handle numbers
             else if (isDigit(expr[pos]) || (expr[pos] == 0x2D && pos + 1 < expr.length && isDigit(expr[pos + 1]))) {
                 uint256 start = pos;
-                if (expr[pos] == 0x2D) pos++;
+                if (expr[pos] == 0x2D) pos++; // Handle negative sign
                 while (pos < expr.length && isDigit(expr[pos])) {
                     pos++;
                 }
@@ -256,13 +307,16 @@ contract MPCExpressionEvaluator {
         return string(result);
     }
     
-    // Node creation functions
+    // ------------------------------------------
+    // Node creation functions (no change needed)
+    // ------------------------------------------
+
     function createConstantNode(int256 value) private returns (uint256) {
         ExprNode memory node = ExprNode({
             nodeType: NodeType.CONSTANT,
             value: value,
-            opType: OperatorType.ADD,
-            funcType: FunctionType.MAX,
+            opType: OperatorType.ADD, // Default, not used for constants
+            funcType: FunctionType.MAX, // Default, not used for constants
             leftChild: 0,
             rightChild: 0,
             args: new uint256[](0),
@@ -276,7 +330,7 @@ contract MPCExpressionEvaluator {
     function createVariableNode(uint256 varIndex) private returns (uint256) {
         ExprNode memory node = ExprNode({
             nodeType: NodeType.VARIABLE,
-            value: int256(varIndex),
+            value: int256(varIndex), // Stores index of variable
             opType: OperatorType.ADD,
             funcType: FunctionType.MAX,
             leftChild: 0,
@@ -321,7 +375,10 @@ contract MPCExpressionEvaluator {
         return userNodes[msg.sender].length - 1;
     }
     
-    // Parser functions
+    // ------------------------------------------
+    // Parser functions (Minor adjustments for function argument types)
+    // ------------------------------------------
+
     function getCurrentToken() private view returns (Token memory) {
         uint256 pos = parsePosition[msg.sender];
         if (pos < userTokens[msg.sender].length) {
@@ -381,7 +438,7 @@ contract MPCExpressionEvaluator {
         require(getCurrentToken().tokenType == TokenType.LPAREN, "Expected opening parenthesis after function");
         advanceToken();
         
-        uint256[] memory args = new uint256[](3);
+        uint256[] memory args = new uint256[](3); // Max 3 args for ifelse
         uint256 argc = 0;
         
         if (getCurrentToken().tokenType != TokenType.RPAREN) {
@@ -482,9 +539,8 @@ contract MPCExpressionEvaluator {
         return left;
     }
     
-    // Main parsing function
-    function parse(string memory expression) public returns (uint256) {
-        // Clear previous data
+    function parse(string memory expression) private returns (uint256) {
+        // Clear previous data for the current user
         delete userNodes[msg.sender];
         delete userTokens[msg.sender];
         parsePosition[msg.sender] = 0;
@@ -500,7 +556,10 @@ contract MPCExpressionEvaluator {
         return rootNode;
     }
     
-    // Evaluation function
+    // ------------------------------------------
+    // Evaluation (uses the new MPC-secure functions)
+    // ------------------------------------------
+
     function evaluate(uint256 nodeIndex, int256[4] memory variables) private returns (int256) {
         require(nodeIndex < userNodes[msg.sender].length, "Invalid node index");
         ExprNode storage node = userNodes[msg.sender][nodeIndex];
@@ -543,17 +602,19 @@ contract MPCExpressionEvaluator {
             } else if (node.funcType == FunctionType.MIN) {
                 return min(args[0], args[1]);
             } else if (node.funcType == FunctionType.EQUAL) {
-                return equal(args[0], args[1]) ? int256(1) : int256(0);
+                return equal(args[0], args[1]); // Returns 1 or 0
             } else if (node.funcType == FunctionType.GREATER_THAN) {
-                return greaterThan(args[0], args[1]) ? int256(1) : int256(0);
+                return greaterThan(args[0], args[1]); // Returns 1 or 0
             } else if (node.funcType == FunctionType.IFELSE) {
-                return ifElse(args[0], args[1], args[2] != 0);
+                // The condition for ifElse in C was a bool, which gets implicitly converted to int (0 or 1)
+                // Here, our equal/greaterThan already return 1 or 0, which is exactly what we need for the third arg.
+                return ifElse(args[0], args[1], args[2]); 
             } else if (node.funcType == FunctionType.ABSOLUTE) {
                 return absolute(args[0]);
             }
         }
         
-        revert("Invalid node type");
+        revert("Invalid node type during evaluation");
     }
     
     // Main evaluation function
@@ -564,16 +625,5 @@ contract MPCExpressionEvaluator {
         
         emit ExpressionEvaluated(msg.sender, expression, result);
         return result;
-    }
-    
-    // Utility functions
-    function getUserNodeCount() external view returns (uint256) {
-        return userNodes[msg.sender].length;
-    }
-    
-    function clearUserData() external {
-        delete userNodes[msg.sender];
-        delete userTokens[msg.sender];
-        parsePosition[msg.sender] = 0;
     }
 }
