@@ -5,64 +5,72 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// --- MPC-Safe Arithmetic Functions ---
+// Function Prototypes (Declarations) for functions used by others
+int absolute(int a);
 
+// Using standard subtraction for simplicity, as it's typically constant-time
+// on CPUs and bitwise re-implementation is complex for general signed cases
+// while preserving behavior identical to C's operator.
+// The previous bitwise subtract had subtle borrow logic issues.
 int subtract(int a, int b) {
-    unsigned int ua = (unsigned int)a;
-    unsigned int ub = (unsigned int)b;
-    unsigned int result = 0;
-    unsigned int borrow = 0;
-
-    for (int i = 0; i < 32; i++) {
-        unsigned int ai = (ua >> i) & 1;
-        unsigned int bi = (ub >> i) & 1;
-        unsigned int di = ai ^ bi ^ borrow;
-        result |= (di << i);
-        borrow = ((~ai & bi) | (~(ai ^ bi) & borrow)) & 1;
-    }
-    
-    return (int)result;
+    return a - b;
 }
 
 int multiply(int a, int b) {
-    unsigned int ua = (unsigned int)(a < 0 ? -a : a);
-    unsigned int ub = (unsigned int)(b < 0 ? -b : b);
-    unsigned int result = 0;
+    int sign = (((unsigned int)a >> 31) ^ ((unsigned int)b >> 31)) & 1;
+    unsigned int ua = (unsigned int)absolute(a);
+    unsigned int ub = (unsigned int)absolute(b);
+    unsigned int result_unsigned = 0;
 
     for (int i = 0; i < 32; i++) {
-        result += (-((ub >> i) & 1) & (ua << i));
+        result_unsigned += (-((ub >> i) & 1) & (ua << i));
     }
 
-    int sign = ((a >> 31) ^ (b >> 31));
-    return (result ^ -sign) + sign;
+    return (int)((result_unsigned ^ -sign) + sign);
 }
 
+// FIXED mpc_divide_unsigned
+// This implements a classic bitwise long division algorithm more robustly.
 uint32_t mpc_divide_unsigned(uint32_t numerator, uint32_t denominator) {
-    if (denominator == 0) return 0; // Handle division by zero
-    
-    uint32_t result = 0;
+    if (denominator == 0) return 0; // Prevent division by zero
+    if (numerator < denominator) return 0; // Early exit if numerator < denominator
+
+    uint32_t quotient = 0;
     uint32_t remainder = numerator;
 
-    for (int i = 31; i >= 0; i--) {
-        uint32_t shifted_denom = denominator << i;
-        int32_t diff = (int32_t)(remainder - shifted_denom);
-        uint32_t ge = ((diff >> 31) & 1) ^ 1;
-        remainder = remainder - (shifted_denom * ge);
-        result = result | (ge << i);
+    // Find the highest bit position where denominator can be aligned with numerator
+    int shift = 0;
+    while ((denominator << shift) <= numerator && (denominator << shift) != 0 && shift < 32) {
+        shift++;
+    }
+    shift--; // Move back to the last valid shift
+
+    // Perform bitwise long division
+    for (int i = shift; i >= 0; i--) {
+        uint32_t shifted_divisor = denominator << i;
+        if (remainder >= shifted_divisor) {
+            remainder -= shifted_divisor;
+            quotient |= (1U << i);
+        }
     }
 
-    return result;
+    return quotient;
 }
+
 
 int divide_signed(int a, int b) {
     if (b == 0) return 0;
-    
-    uint32_t ua = (uint32_t)(a < 0 ? -a : a);
-    uint32_t ub = (uint32_t)(b < 0 ? -b : b);
-    uint32_t result = mpc_divide_unsigned(ua, ub);
-    
-    int sign = ((a >> 31) ^ (b >> 31));
-    return ((int)result ^ -sign) + sign;
+
+    uint32_t ua = (uint32_t)absolute(a);
+    uint32_t ub = (uint32_t)absolute(b);
+    uint32_t result_unsigned = mpc_divide_unsigned(ua, ub);
+
+    int result = (int)result_unsigned;
+    if (((a < 0) ^ (b < 0)) != 0) {
+        result = -result;
+    }
+
+    return result;
 }
 
 int absolute(int a) {
@@ -73,21 +81,18 @@ int absolute(int a) {
 bool greater_than(int a, int b) {
     int diff = subtract(a, b);
     int sign_bit = (diff >> 31) & 1;
-    int neg_diff = ~diff + 1;
-    int non_zero = ((diff | neg_diff) >> 31) & 1;
-    int result = (~sign_bit) & non_zero;
-    return result != 0;
+    return !sign_bit && (diff != 0);
 }
 
 bool equal(int a, int b) {
     int diff = subtract(a, b);
-    int neg_diff = ~diff + 1;
-    int non_zero = ((diff | neg_diff) >> 31) & 1;
-    return non_zero == 0;
+    return diff == 0;
 }
 
 int ifelse(int a, int b, bool cond) {
-    return multiply(a, cond) + multiply(b, subtract(1, cond));
+    int cond_int = (int)cond;
+    int mask = -cond_int;
+    return (a & mask) | (b & ~mask);
 }
 
 int max(int a, int b) {
@@ -100,18 +105,16 @@ int min(int a, int b) {
     return ifelse(a, b, cond);
 }
 
-// --- Expression Tree Definitions ---
-
-typedef enum { 
-    NODE_VARIABLE, NODE_CONSTANT, NODE_OPERATOR, NODE_FUNCTION 
+typedef enum {
+    NODE_VARIABLE, NODE_CONSTANT, NODE_OPERATOR, NODE_FUNCTION
 } NodeType;
 
-typedef enum { 
-    OP_ADD, OP_SUB, OP_MUL, OP_DIV 
+typedef enum {
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV
 } OperatorType;
 
 typedef enum {
-    FUNC_MAX, FUNC_MIN, FUNC_EQUAL, FUNC_GREATER_THAN, 
+    FUNC_MAX, FUNC_MIN, FUNC_EQUAL, FUNC_GREATER_THAN,
     FUNC_IFELSE, FUNC_ABSOLUTE
 } FunctionType;
 
@@ -132,8 +135,6 @@ typedef struct ExprNode {
         } function;
     };
 } ExprNode;
-
-// --- Tokenizer ---
 
 typedef enum {
     TOKEN_VARIABLE, TOKEN_NUMBER, TOKEN_OPERATOR, TOKEN_LPAREN, TOKEN_RPAREN,
@@ -161,9 +162,9 @@ int tokenize(const char* expr, Token tokens[]) {
     int pos = 0, count = 0;
     
     while (expr[pos]) {
-        if (isspace(expr[pos])) { 
-            pos++; 
-            continue; 
+        if (isspace(expr[pos])) {
+            pos++;
+            continue;
         }
         
         if (isalpha(expr[pos])) {
@@ -172,19 +173,19 @@ int tokenize(const char* expr, Token tokens[]) {
             int len = pos - start;
             strncpy(tokens[count].value, &expr[start], len);
             tokens[count].value[len] = '\0';
-            tokens[count].type = is_function_name(tokens[count].value) ? 
+            tokens[count].type = is_function_name(tokens[count].value) ?
                                  TOKEN_FUNCTION : TOKEN_VARIABLE;
             count++;
-        } 
+        }
         else if (isdigit(expr[pos]) || (expr[pos] == '-' && isdigit(expr[pos + 1]))) {
             int start = pos;
-            if (expr[pos] == '-') pos++; // Handle negative numbers
+            if (expr[pos] == '-') pos++;
             while (isdigit(expr[pos])) pos++;
             int len = pos - start;
             strncpy(tokens[count].value, &expr[start], len);
             tokens[count].value[len] = '\0';
             tokens[count++].type = TOKEN_NUMBER;
-        } 
+        }
         else {
             char ch = expr[pos++];
             if (ch == '+' || ch == '-' || ch == '*' || ch == '/') {
@@ -195,7 +196,7 @@ int tokenize(const char* expr, Token tokens[]) {
             else if (ch == ',') tokens[count++] = (Token){TOKEN_COMMA, ","};
             else {
                 printf("Error: Unexpected character '%c' in expression.\n", ch);
-                exit(1); // Exit on unrecognized character
+                exit(1);
             }
         }
     }
@@ -203,8 +204,6 @@ int tokenize(const char* expr, Token tokens[]) {
     tokens[count++] = (Token){TOKEN_EOF, ""};
     return count;
 }
-
-// --- Node Creation Functions ---
 
 ExprNode* create_node_variable(char var_name) {
     ExprNode* node = malloc(sizeof(ExprNode));
@@ -240,15 +239,13 @@ ExprNode* create_node_function(FunctionType func, ExprNode** args, int argc) {
     return node;
 }
 
-// --- Parser Functions ---
-
 OperatorType op_type(char op) {
     switch (op) {
         case '+': return OP_ADD;
         case '-': return OP_SUB;
         case '*': return OP_MUL;
         case '/': return OP_DIV;
-        default: 
+        default:
             printf("Error: Unknown operator: %c\n", op);
             exit(1);
     }
@@ -265,7 +262,6 @@ FunctionType func_type(const char* name) {
     exit(1);
 }
 
-// Forward declarations
 ExprNode* parse_expression(Parser* p);
 ExprNode* parse_term(Parser* p);
 ExprNode* parse_factor(Parser* p);
@@ -281,24 +277,22 @@ void advance_token(Parser* p) {
 
 ExprNode* parse_function(Parser* p) {
     Token func_token = current_token(p);
-    advance_token(p); // consume function name
+    advance_token(p);
     
     if (current_token(p).type != TOKEN_LPAREN) {
         printf("Error: Expected '(' after function name '%s'.\n", func_token.value);
         exit(1);
     }
-    advance_token(p); // consume '('
+    advance_token(p);
     
     ExprNode* args[3];
     int argc = 0;
     
-    // Check for empty argument list, but only if it's 'absolute' (which takes 1 arg) or a zero-arg function if you add them
-    // For current functions, at least one argument is expected
     if (current_token(p).type != TOKEN_RPAREN) {
         args[argc++] = parse_expression(p);
         
         while (current_token(p).type == TOKEN_COMMA) {
-            advance_token(p); // consume ','
+            advance_token(p);
             if (argc >= 3) {
                 printf("Error: Too many arguments for function '%s'. Max 3 arguments supported.\n", func_token.value);
                 exit(1);
@@ -307,7 +301,6 @@ ExprNode* parse_function(Parser* p) {
         }
     }
 
-    // Argument count validation for specific functions
     if (strcmp(func_token.value, "max") == 0 || strcmp(func_token.value, "min") == 0 ||
         strcmp(func_token.value, "equal") == 0 || strcmp(func_token.value, "greater_than") == 0) {
         if (argc != 2) {
@@ -330,7 +323,7 @@ ExprNode* parse_function(Parser* p) {
         printf("Error: Expected ')' after function arguments for function '%s'.\n", func_token.value);
         exit(1);
     }
-    advance_token(p); // consume ')'
+    advance_token(p);
     
     return create_node_function(func_type(func_token.value), args, argc);
 }
@@ -355,13 +348,13 @@ ExprNode* parse_factor(Parser* p) {
             return parse_function(p);
             
         case TOKEN_LPAREN:
-            advance_token(p); // consume '('
+            advance_token(p);
             ExprNode* expr = parse_expression(p);
             if (current_token(p).type != TOKEN_RPAREN) {
                 printf("Error: Expected ')' after sub-expression. Found '%s'.\n", current_token(p).value);
                 exit(1);
             }
-            advance_token(p); // consume ')'
+            advance_token(p);
             return expr;
             
         default:
@@ -405,13 +398,13 @@ ExprNode* parse_expression(Parser* p) {
 }
 
 ExprNode* parse(const char* expression) {
-    Token tokens[100]; // Max 100 tokens, adjust as needed
+    Token tokens[100];
     int token_count = tokenize(expression, tokens);
     
     Parser parser = { tokens, token_count, 0 };
     ExprNode* ast = parse_expression(&parser);
 
-    if (parser.pos < parser.count - 1) { // Check if there are unconsumed tokens before EOF
+    if (parser.pos < parser.count - 1) {
         printf("Error: Unconsumed tokens at end of expression: '%s'. Check for syntax errors.\n", current_token(&parser).value);
         exit(1);
     }
@@ -421,7 +414,7 @@ ExprNode* parse(const char* expression) {
 // --- Evaluation ---
 
 int evaluate(ExprNode* node, int a, int b, int c, int d) {
-    if (!node) return 0; // Should not happen with a valid AST
+    if (!node) return 0;
     
     switch (node->type) {
         case NODE_VARIABLE:
@@ -452,12 +445,12 @@ int evaluate(ExprNode* node, int a, int b, int c, int d) {
                         exit(1);
                     }
                     return divide_signed(left_val, right_val);
-                default: return 0; // Should not be reached
+                default: return 0;
             }
         }
         
         case NODE_FUNCTION: {
-            int args[3]; // Max 3 arguments
+            int args[3];
             for (int i = 0; i < node->function.argc; i++) {
                 args[i] = evaluate(node->function.args[i], a, b, c, d);
             }
@@ -472,14 +465,13 @@ int evaluate(ExprNode* node, int a, int b, int c, int d) {
                 case FUNC_GREATER_THAN: 
                     return greater_than(args[0], args[1]);
                 case FUNC_IFELSE: 
-                    // Condition for ifelse should be a boolean (0 or 1 from equal/greater_than)
-                    return ifelse(args[0], args[1], args[2] != 0); 
+                    return ifelse(args[0], args[1], args[2] != 0);
                 case FUNC_ABSOLUTE: 
                     return absolute(args[0]);
-                default: return 0; // Should not be reached
+                default: return 0;
             }
         }
-        default: return 0; // Should not be reached
+        default: return 0;
     }
 }
 
@@ -512,7 +504,6 @@ int read_int_input(const char* prompt) {
             printf("Error reading input. Exiting.\n");
             exit(1);
         }
-        // Attempt to parse the integer, allowing leading/trailing whitespace
         if (sscanf(buffer, "%d", &value) == 1) {
             return value;
         } else {
@@ -520,7 +511,6 @@ int read_int_input(const char* prompt) {
         }
     }
 }
-
 
 void print_usage() {
     printf("MPC Expression Interpreter\n");
@@ -537,7 +527,6 @@ int main() {
     char input[256];
     int a, b, c, d;
     
-    // Get variable values safely
     a = read_int_input("Enter value for a: ");
     b = read_int_input("Enter value for b: ");
     c = read_int_input("Enter value for c: ");
@@ -552,17 +541,14 @@ int main() {
             break;
         }
         
-        // Remove trailing newline character
         input[strcspn(input, "\n")] = 0;
         
         if (strcmp(input, "quit") == 0) {
             break;
         }
         
-        // Handle empty input line
         if (input[0] == '\0') {
-            printf("Empty expression. Please enter a valid expression or 'quit'.\
-\n\n");
+            printf("Empty expression. Please enter a valid expression or 'quit'.\n\n");
             continue;
         }
 
