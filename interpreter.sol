@@ -3,39 +3,45 @@ pragma solidity ^0.8.0;
 
 contract MPCExpressionEvaluator {
     
-    // Enums for node types
+    // Enums for parsing
+    enum TokenType { VARIABLE, NUMBER, OPERATOR, LPAREN, RPAREN, FUNCTION, COMMA, EOF }
     enum NodeType { VARIABLE, CONSTANT, OPERATOR, FUNCTION }
     enum OperatorType { ADD, SUB, MUL, DIV }
     enum FunctionType { MAX, MIN, EQUAL, GREATER_THAN, IFELSE, ABSOLUTE }
     
-    // Struct to represent expression nodes
+    struct Token {
+        TokenType tokenType;
+        string value;
+        int256 numValue;
+    }
+    
     struct ExprNode {
         NodeType nodeType;
-        int256 value; // Used for constants and variable indices (0=a, 1=b, 2=c, 3=d)
+        int256 value; // For constants and variable indices
         OperatorType opType;
         FunctionType funcType;
-        uint256 leftChild;  // Index in nodes array
-        uint256 rightChild; // Index in nodes array
-        uint256[] args;     // For function arguments
+        uint256 leftChild;
+        uint256 rightChild;
+        uint256[] args;
         bool isValid;
     }
     
-    // Storage for expression tree nodes
-    ExprNode[] private nodes;
+    // Storage
     mapping(address => ExprNode[]) private userNodes;
+    mapping(address => Token[]) private userTokens;
+    mapping(address => uint256) private parsePosition;
     
     // Events
-    event ExpressionEvaluated(address indexed user, int256 result);
-    event ExpressionParsed(address indexed user, uint256 rootNodeIndex);
+    event ExpressionEvaluated(address indexed user, string expression, int256 result);
+    event ExpressionParsed(address indexed user, string expression, uint256 rootNodeIndex);
     
-    // Mathematical operations without using standard operators
+    // Mathematical operations
     function absolute(int256 a) public pure returns (int256) {
-        int256 mask = a >> 255; // Get sign bit (all 1s if negative, all 0s if positive)
-        return (a + mask) ^ mask;
+        return a < 0 ? -a : a;
     }
     
     function subtract(int256 a, int256 b) public pure returns (int256) {
-        return a - b; // Using standard subtraction as in original
+        return a - b;
     }
     
     function multiply(int256 a, int256 b) public pure returns (int256) {
@@ -64,7 +70,6 @@ contract MPCExpressionEvaluator {
         uint256 quotient = 0;
         uint256 remainder = numerator;
         
-        // Find the highest bit position
         uint256 shift = 0;
         uint256 tempDenom = denominator;
         while (tempDenom <= numerator && shift < 256) {
@@ -73,7 +78,6 @@ contract MPCExpressionEvaluator {
         }
         if (shift > 0) shift--;
         
-        // Perform bitwise long division
         for (uint256 i = 0; i <= shift; i++) {
             uint256 shiftedDivisor = denominator << (shift - i);
             if (remainder >= shiftedDivisor) {
@@ -97,33 +101,168 @@ contract MPCExpressionEvaluator {
     }
     
     function greaterThan(int256 a, int256 b) public pure returns (bool) {
-        int256 diff = subtract(a, b);
-        return diff > 0;
+        return a > b;
     }
     
     function equal(int256 a, int256 b) public pure returns (bool) {
-        return subtract(a, b) == 0;
+        return a == b;
     }
     
     function max(int256 a, int256 b) public pure returns (int256) {
-        return greaterThan(a, b) ? a : b;
+        return a > b ? a : b;
     }
     
     function min(int256 a, int256 b) public pure returns (int256) {
-        return greaterThan(b, a) ? a : b;
+        return a < b ? a : b;
     }
     
     function ifElse(int256 trueVal, int256 falseVal, bool condition) public pure returns (int256) {
         return condition ? trueVal : falseVal;
     }
     
-    // Helper function to create nodes
+    // String utilities
+    function isAlpha(bytes1 char) private pure returns (bool) {
+        return (char >= 0x41 && char <= 0x5A) || (char >= 0x61 && char <= 0x7A);
+    }
+    
+    function isDigit(bytes1 char) private pure returns (bool) {
+        return char >= 0x30 && char <= 0x39;
+    }
+    
+    function isSpace(bytes1 char) private pure returns (bool) {
+        return char == 0x20 || char == 0x09 || char == 0x0A || char == 0x0D;
+    }
+    
+    function stringToInt(string memory str) private pure returns (int256) {
+        bytes memory b = bytes(str);
+        int256 result = 0;
+        bool negative = false;
+        uint256 start = 0;
+        
+        if (b.length > 0 && b[0] == 0x2D) { // '-' character
+            negative = true;
+            start = 1;
+        }
+        
+        for (uint256 i = start; i < b.length; i++) {
+            if (isDigit(b[i])) {
+                result = result * 10 + int256(uint256(uint8(b[i]) - 48));
+            }
+        }
+        
+        return negative ? -result : result;
+    }
+    
+    function stringsEqual(string memory a, string memory b) private pure returns (bool) {
+        return keccak256(bytes(a)) == keccak256(bytes(b));
+    }
+    
+    function isFunction(string memory word) private pure returns (bool) {
+        return stringsEqual(word, "max") || stringsEqual(word, "min") || 
+               stringsEqual(word, "equal") || stringsEqual(word, "greater_than") ||
+               stringsEqual(word, "ifelse") || stringsEqual(word, "absolute");
+    }
+    
+    // Tokenization
+    function tokenize(string memory expression) private {
+        bytes memory expr = bytes(expression);
+        delete userTokens[msg.sender];
+        
+        uint256 pos = 0;
+        
+        while (pos < expr.length) {
+            // Skip whitespace
+            if (isSpace(expr[pos])) {
+                pos++;
+                continue;
+            }
+            
+            // Handle alphabetic characters (variables and functions)
+            if (isAlpha(expr[pos])) {
+                uint256 start = pos;
+                while (pos < expr.length && (isAlpha(expr[pos]) || isDigit(expr[pos]) || expr[pos] == 0x5F)) {
+                    pos++;
+                }
+                
+                string memory word = substring(expression, start, pos);
+                
+                Token memory token;
+                token.value = word;
+                token.tokenType = isFunction(word) ? TokenType.FUNCTION : TokenType.VARIABLE;
+                userTokens[msg.sender].push(token);
+            }
+            // Handle numbers
+            else if (isDigit(expr[pos]) || (expr[pos] == 0x2D && pos + 1 < expr.length && isDigit(expr[pos + 1]))) {
+                uint256 start = pos;
+                if (expr[pos] == 0x2D) pos++;
+                while (pos < expr.length && isDigit(expr[pos])) {
+                    pos++;
+                }
+                
+                string memory numStr = substring(expression, start, pos);
+                Token memory token;
+                token.value = numStr;
+                token.numValue = stringToInt(numStr);
+                token.tokenType = TokenType.NUMBER;
+                userTokens[msg.sender].push(token);
+            }
+            // Handle operators and punctuation
+            else {
+                Token memory token;
+                
+                if (expr[pos] == 0x2B) { // '+'
+                    token.tokenType = TokenType.OPERATOR;
+                    token.value = "+";
+                } else if (expr[pos] == 0x2D) { // '-'
+                    token.tokenType = TokenType.OPERATOR;
+                    token.value = "-";
+                } else if (expr[pos] == 0x2A) { // '*'
+                    token.tokenType = TokenType.OPERATOR;
+                    token.value = "*";
+                } else if (expr[pos] == 0x2F) { // '/'
+                    token.tokenType = TokenType.OPERATOR;
+                    token.value = "/";
+                } else if (expr[pos] == 0x28) { // '('
+                    token.tokenType = TokenType.LPAREN;
+                    token.value = "(";
+                } else if (expr[pos] == 0x29) { // ')'
+                    token.tokenType = TokenType.RPAREN;
+                    token.value = ")";
+                } else if (expr[pos] == 0x2C) { // ','
+                    token.tokenType = TokenType.COMMA;
+                    token.value = ",";
+                } else {
+                    revert("Unexpected character in expression");
+                }
+                
+                userTokens[msg.sender].push(token);
+                pos++;
+            }
+        }
+        
+        // Add EOF token
+        Token memory eofToken;
+        eofToken.tokenType = TokenType.EOF;
+        eofToken.value = "";
+        userTokens[msg.sender].push(eofToken);
+    }
+    
+    function substring(string memory str, uint256 start, uint256 end) private pure returns (string memory) {
+        bytes memory strBytes = bytes(str);
+        bytes memory result = new bytes(end - start);
+        for (uint256 i = start; i < end; i++) {
+            result[i - start] = strBytes[i];
+        }
+        return string(result);
+    }
+    
+    // Node creation functions
     function createConstantNode(int256 value) private returns (uint256) {
         ExprNode memory node = ExprNode({
             nodeType: NodeType.CONSTANT,
             value: value,
-            opType: OperatorType.ADD, // Default value
-            funcType: FunctionType.MAX, // Default value
+            opType: OperatorType.ADD,
+            funcType: FunctionType.MAX,
             leftChild: 0,
             rightChild: 0,
             args: new uint256[](0),
@@ -135,13 +274,11 @@ contract MPCExpressionEvaluator {
     }
     
     function createVariableNode(uint256 varIndex) private returns (uint256) {
-        require(varIndex < 4, "Variable index must be 0-3 (a-d)");
-        
         ExprNode memory node = ExprNode({
             nodeType: NodeType.VARIABLE,
             value: int256(varIndex),
-            opType: OperatorType.ADD, // Default value
-            funcType: FunctionType.MAX, // Default value
+            opType: OperatorType.ADD,
+            funcType: FunctionType.MAX,
             leftChild: 0,
             rightChild: 0,
             args: new uint256[](0),
@@ -157,7 +294,7 @@ contract MPCExpressionEvaluator {
             nodeType: NodeType.OPERATOR,
             value: 0,
             opType: op,
-            funcType: FunctionType.MAX, // Default value
+            funcType: FunctionType.MAX,
             leftChild: left,
             rightChild: right,
             args: new uint256[](0),
@@ -172,7 +309,7 @@ contract MPCExpressionEvaluator {
         ExprNode memory node = ExprNode({
             nodeType: NodeType.FUNCTION,
             value: 0,
-            opType: OperatorType.ADD, // Default value
+            opType: OperatorType.ADD,
             funcType: func,
             leftChild: 0,
             rightChild: 0,
@@ -184,107 +321,187 @@ contract MPCExpressionEvaluator {
         return userNodes[msg.sender].length - 1;
     }
     
-    // Simplified expression builder functions
-    // Users will need to build expressions programmatically
-    
-    function buildSimpleExpression(
-        string memory operation,
-        int256 leftOperand,
-        int256 rightOperand,
-        bool leftIsVariable,
-        bool rightIsVariable
-    ) external returns (uint256) {
-        // Clear previous user nodes
-        delete userNodes[msg.sender];
-        
-        uint256 leftNode;
-        uint256 rightNode;
-        
-        if (leftIsVariable) {
-            require(leftOperand >= 0 && leftOperand < 4, "Variable index must be 0-3");
-            leftNode = createVariableNode(uint256(leftOperand));
-        } else {
-            leftNode = createConstantNode(leftOperand);
+    // Parser functions
+    function getCurrentToken() private view returns (Token memory) {
+        uint256 pos = parsePosition[msg.sender];
+        if (pos < userTokens[msg.sender].length) {
+            return userTokens[msg.sender][pos];
         }
-        
-        if (rightIsVariable) {
-            require(rightOperand >= 0 && rightOperand < 4, "Variable index must be 0-3");
-            rightNode = createVariableNode(uint256(rightOperand));
-        } else {
-            rightNode = createConstantNode(rightOperand);
-        }
-        
-        OperatorType op;
-        if (keccak256(bytes(operation)) == keccak256(bytes("add"))) {
-            op = OperatorType.ADD;
-        } else if (keccak256(bytes(operation)) == keccak256(bytes("sub"))) {
-            op = OperatorType.SUB;
-        } else if (keccak256(bytes(operation)) == keccak256(bytes("mul"))) {
-            op = OperatorType.MUL;
-        } else if (keccak256(bytes(operation)) == keccak256(bytes("div"))) {
-            op = OperatorType.DIV;
-        } else {
-            revert("Invalid operation");
-        }
-        
-        uint256 rootNode = createOperatorNode(op, leftNode, rightNode);
-        emit ExpressionParsed(msg.sender, rootNode);
-        return rootNode;
+        Token memory eofToken;
+        eofToken.tokenType = TokenType.EOF;
+        return eofToken;
     }
     
-    function buildFunctionExpression(
-        string memory functionName,
-        uint256[] memory argValues,
-        bool[] memory argIsVariable
-    ) external returns (uint256) {
-        require(argValues.length == argIsVariable.length, "Arguments length mismatch");
+    function advanceToken() private {
+        parsePosition[msg.sender]++;
+    }
+    
+    function parseFactor() private returns (uint256) {
+        Token memory token = getCurrentToken();
         
-        // Clear previous user nodes
-        delete userNodes[msg.sender];
-        
-        FunctionType func;
-        uint256 expectedArgs;
-        
-        if (keccak256(bytes(functionName)) == keccak256(bytes("max"))) {
-            func = FunctionType.MAX;
-            expectedArgs = 2;
-        } else if (keccak256(bytes(functionName)) == keccak256(bytes("min"))) {
-            func = FunctionType.MIN;
-            expectedArgs = 2;
-        } else if (keccak256(bytes(functionName)) == keccak256(bytes("equal"))) {
-            func = FunctionType.EQUAL;
-            expectedArgs = 2;
-        } else if (keccak256(bytes(functionName)) == keccak256(bytes("greater_than"))) {
-            func = FunctionType.GREATER_THAN;
-            expectedArgs = 2;
-        } else if (keccak256(bytes(functionName)) == keccak256(bytes("ifelse"))) {
-            func = FunctionType.IFELSE;
-            expectedArgs = 3;
-        } else if (keccak256(bytes(functionName)) == keccak256(bytes("absolute"))) {
-            func = FunctionType.ABSOLUTE;
-            expectedArgs = 1;
-        } else {
-            revert("Invalid function name");
+        if (token.tokenType == TokenType.NUMBER) {
+            advanceToken();
+            return createConstantNode(token.numValue);
         }
         
-        require(argValues.length == expectedArgs, "Invalid number of arguments");
+        if (token.tokenType == TokenType.VARIABLE) {
+            advanceToken();
+            bytes memory varBytes = bytes(token.value);
+            require(varBytes.length == 1, "Variables must be single characters");
+            
+            uint256 varIndex;
+            if (varBytes[0] == 0x61) varIndex = 0; // 'a'
+            else if (varBytes[0] == 0x62) varIndex = 1; // 'b'
+            else if (varBytes[0] == 0x63) varIndex = 2; // 'c'
+            else if (varBytes[0] == 0x64) varIndex = 3; // 'd'
+            else revert("Invalid variable. Use a, b, c, or d");
+            
+            return createVariableNode(varIndex);
+        }
         
-        uint256[] memory argNodes = new uint256[](argValues.length);
-        for (uint256 i = 0; i < argValues.length; i++) {
-            if (argIsVariable[i]) {
-                require(argValues[i] < 4, "Variable index must be 0-3");
-                argNodes[i] = createVariableNode(argValues[i]);
-            } else {
-                argNodes[i] = createConstantNode(int256(argValues[i]));
+        if (token.tokenType == TokenType.FUNCTION) {
+            return parseFunction();
+        }
+        
+        if (token.tokenType == TokenType.LPAREN) {
+            advanceToken();
+            uint256 expr = parseExpression();
+            require(getCurrentToken().tokenType == TokenType.RPAREN, "Expected closing parenthesis");
+            advanceToken();
+            return expr;
+        }
+        
+        revert("Unexpected token in expression");
+    }
+    
+    function parseFunction() private returns (uint256) {
+        Token memory funcToken = getCurrentToken();
+        advanceToken();
+        
+        require(getCurrentToken().tokenType == TokenType.LPAREN, "Expected opening parenthesis after function");
+        advanceToken();
+        
+        uint256[] memory args = new uint256[](3);
+        uint256 argc = 0;
+        
+        if (getCurrentToken().tokenType != TokenType.RPAREN) {
+            args[argc] = parseExpression();
+            argc++;
+            
+            while (getCurrentToken().tokenType == TokenType.COMMA) {
+                advanceToken();
+                require(argc < 3, "Too many function arguments");
+                args[argc] = parseExpression();
+                argc++;
             }
         }
         
-        uint256 rootNode = createFunctionNode(func, argNodes);
-        emit ExpressionParsed(msg.sender, rootNode);
+        require(getCurrentToken().tokenType == TokenType.RPAREN, "Expected closing parenthesis");
+        advanceToken();
+        
+        // Validate argument count and get function type
+        FunctionType func;
+        if (stringsEqual(funcToken.value, "max")) {
+            require(argc == 2, "max function requires 2 arguments");
+            func = FunctionType.MAX;
+        } else if (stringsEqual(funcToken.value, "min")) {
+            require(argc == 2, "min function requires 2 arguments");
+            func = FunctionType.MIN;
+        } else if (stringsEqual(funcToken.value, "equal")) {
+            require(argc == 2, "equal function requires 2 arguments");
+            func = FunctionType.EQUAL;
+        } else if (stringsEqual(funcToken.value, "greater_than")) {
+            require(argc == 2, "greater_than function requires 2 arguments");
+            func = FunctionType.GREATER_THAN;
+        } else if (stringsEqual(funcToken.value, "ifelse")) {
+            require(argc == 3, "ifelse function requires 3 arguments");
+            func = FunctionType.IFELSE;
+        } else if (stringsEqual(funcToken.value, "absolute")) {
+            require(argc == 1, "absolute function requires 1 argument");
+            func = FunctionType.ABSOLUTE;
+        } else {
+            revert("Unknown function");
+        }
+        
+        // Create array with actual argument count
+        uint256[] memory actualArgs = new uint256[](argc);
+        for (uint256 i = 0; i < argc; i++) {
+            actualArgs[i] = args[i];
+        }
+        
+        return createFunctionNode(func, actualArgs);
+    }
+    
+    function parseTerm() private returns (uint256) {
+        uint256 left = parseFactor();
+        
+        while (getCurrentToken().tokenType == TokenType.OPERATOR) {
+            Token memory op = getCurrentToken();
+            if (stringsEqual(op.value, "*") || stringsEqual(op.value, "/")) {
+                advanceToken();
+                uint256 right = parseFactor();
+                
+                OperatorType opType;
+                if (stringsEqual(op.value, "*")) {
+                    opType = OperatorType.MUL;
+                } else {
+                    opType = OperatorType.DIV;
+                }
+                
+                left = createOperatorNode(opType, left, right);
+            } else {
+                break;
+            }
+        }
+        
+        return left;
+    }
+    
+    function parseExpression() private returns (uint256) {
+        uint256 left = parseTerm();
+        
+        while (getCurrentToken().tokenType == TokenType.OPERATOR) {
+            Token memory op = getCurrentToken();
+            if (stringsEqual(op.value, "+") || stringsEqual(op.value, "-")) {
+                advanceToken();
+                uint256 right = parseTerm();
+                
+                OperatorType opType;
+                if (stringsEqual(op.value, "+")) {
+                    opType = OperatorType.ADD;
+                } else {
+                    opType = OperatorType.SUB;
+                }
+                
+                left = createOperatorNode(opType, left, right);
+            } else {
+                break;
+            }
+        }
+        
+        return left;
+    }
+    
+    // Main parsing function
+    function parse(string memory expression) public returns (uint256) {
+        // Clear previous data
+        delete userNodes[msg.sender];
+        delete userTokens[msg.sender];
+        parsePosition[msg.sender] = 0;
+        
+        // Tokenize and parse
+        tokenize(expression);
+        uint256 rootNode = parseExpression();
+        
+        // Verify all tokens consumed
+        require(getCurrentToken().tokenType == TokenType.EOF, "Unexpected tokens at end of expression");
+        
+        emit ExpressionParsed(msg.sender, expression, rootNode);
         return rootNode;
     }
     
-    function evaluate(uint256 nodeIndex, int256[4] memory variables) public returns (int256) {
+    // Evaluation function
+    function evaluate(uint256 nodeIndex, int256[4] memory variables) private returns (int256) {
         require(nodeIndex < userNodes[msg.sender].length, "Invalid node index");
         ExprNode storage node = userNodes[msg.sender][nodeIndex];
         require(node.isValid, "Invalid node");
@@ -339,42 +556,24 @@ contract MPCExpressionEvaluator {
         revert("Invalid node type");
     }
     
-    function evaluateExpression(uint256 rootNodeIndex, int256 a, int256 b, int256 c, int256 d) external returns (int256) {
+    // Main evaluation function
+    function evaluateExpression(string memory expression, int256 a, int256 b, int256 c, int256 d) external returns (int256) {
+        uint256 rootNode = parse(expression);
         int256[4] memory variables = [a, b, c, d];
-        int256 result = evaluate(rootNodeIndex, variables);
-        emit ExpressionEvaluated(msg.sender, result);
+        int256 result = evaluate(rootNode, variables);
+        
+        emit ExpressionEvaluated(msg.sender, expression, result);
         return result;
     }
     
     // Utility functions
-    function clearUserNodes() external {
-        delete userNodes[msg.sender];
-    }
-    
     function getUserNodeCount() external view returns (uint256) {
         return userNodes[msg.sender].length;
     }
     
-    function getNodeInfo(uint256 nodeIndex) external view returns (
-        NodeType nodeType,
-        int256 value,
-        OperatorType opType,
-        FunctionType funcType,
-        uint256 leftChild,
-        uint256 rightChild,
-        uint256[] memory args
-    ) {
-        require(nodeIndex < userNodes[msg.sender].length, "Invalid node index");
-        ExprNode storage node = userNodes[msg.sender][nodeIndex];
-        
-        return (
-            node.nodeType,
-            node.value,
-            node.opType,
-            node.funcType,
-            node.leftChild,
-            node.rightChild,
-            node.args
-        );
+    function clearUserData() external {
+        delete userNodes[msg.sender];
+        delete userTokens[msg.sender];
+        parsePosition[msg.sender] = 0;
     }
 }
