@@ -193,6 +193,10 @@ int tokenize(const char* expr, Token tokens[]) {
             else if (ch == '(') tokens[count++] = (Token){TOKEN_LPAREN, "("};
             else if (ch == ')') tokens[count++] = (Token){TOKEN_RPAREN, ")"};
             else if (ch == ',') tokens[count++] = (Token){TOKEN_COMMA, ","};
+            else {
+                printf("Error: Unexpected character '%c' in expression.\n", ch);
+                exit(1); // Exit on unrecognized character
+            }
         }
     }
     
@@ -245,7 +249,7 @@ OperatorType op_type(char op) {
         case '*': return OP_MUL;
         case '/': return OP_DIV;
         default: 
-            printf("Unknown operator: %c\n", op);
+            printf("Error: Unknown operator: %c\n", op);
             exit(1);
     }
 }
@@ -257,7 +261,7 @@ FunctionType func_type(const char* name) {
     if (strcmp(name, "greater_than") == 0) return FUNC_GREATER_THAN;
     if (strcmp(name, "ifelse") == 0) return FUNC_IFELSE;
     if (strcmp(name, "absolute") == 0) return FUNC_ABSOLUTE;
-    printf("Unknown function: %s\n", name);
+    printf("Error: Unknown function: %s\n", name);
     exit(1);
 }
 
@@ -280,7 +284,7 @@ ExprNode* parse_function(Parser* p) {
     advance_token(p); // consume function name
     
     if (current_token(p).type != TOKEN_LPAREN) {
-        printf("Expected '(' after function name\n");
+        printf("Error: Expected '(' after function name '%s'.\n", func_token.value);
         exit(1);
     }
     advance_token(p); // consume '('
@@ -288,21 +292,42 @@ ExprNode* parse_function(Parser* p) {
     ExprNode* args[3];
     int argc = 0;
     
+    // Check for empty argument list, but only if it's 'absolute' (which takes 1 arg) or a zero-arg function if you add them
+    // For current functions, at least one argument is expected
     if (current_token(p).type != TOKEN_RPAREN) {
         args[argc++] = parse_expression(p);
         
         while (current_token(p).type == TOKEN_COMMA) {
             advance_token(p); // consume ','
             if (argc >= 3) {
-                printf("Too many function arguments\n");
+                printf("Error: Too many arguments for function '%s'. Max 3 arguments supported.\n", func_token.value);
                 exit(1);
             }
             args[argc++] = parse_expression(p);
         }
     }
+
+    // Argument count validation for specific functions
+    if (strcmp(func_token.value, "max") == 0 || strcmp(func_token.value, "min") == 0 ||
+        strcmp(func_token.value, "equal") == 0 || strcmp(func_token.value, "greater_than") == 0) {
+        if (argc != 2) {
+            printf("Error: Function '%s' expects 2 arguments, but got %d.\n", func_token.value, argc);
+            exit(1);
+        }
+    } else if (strcmp(func_token.value, "ifelse") == 0) {
+        if (argc != 3) {
+            printf("Error: Function '%s' expects 3 arguments, but got %d.\n", func_token.value, argc);
+            exit(1);
+        }
+    } else if (strcmp(func_token.value, "absolute") == 0) {
+        if (argc != 1) {
+            printf("Error: Function '%s' expects 1 argument, but got %d.\n", func_token.value, argc);
+            exit(1);
+        }
+    }
     
     if (current_token(p).type != TOKEN_RPAREN) {
-        printf("Expected ')' after function arguments\n");
+        printf("Error: Expected ')' after function arguments for function '%s'.\n", func_token.value);
         exit(1);
     }
     advance_token(p); // consume ')'
@@ -321,7 +346,7 @@ ExprNode* parse_factor(Parser* p) {
         case TOKEN_VARIABLE:
             advance_token(p);
             if (strlen(token.value) != 1) {
-                printf("Variables must be single characters. Invalid variable: %s\n", token.value);
+                printf("Error: Variables must be single characters (a, b, c, d). Invalid variable: '%s'.\n", token.value);
                 exit(1);
             }
             return create_node_variable(token.value[0]);
@@ -333,14 +358,14 @@ ExprNode* parse_factor(Parser* p) {
             advance_token(p); // consume '('
             ExprNode* expr = parse_expression(p);
             if (current_token(p).type != TOKEN_RPAREN) {
-                printf("Expected ')'\n");
+                printf("Error: Expected ')' after sub-expression. Found '%s'.\n", current_token(p).value);
                 exit(1);
             }
             advance_token(p); // consume ')'
             return expr;
             
         default:
-            printf("Unexpected token in factor: %s (type: %d)\n", token.value, token.type);
+            printf("Error: Unexpected token '%s' (type: %d) in factor.\n", token.value, token.type);
             exit(1);
     }
 }
@@ -380,17 +405,23 @@ ExprNode* parse_expression(Parser* p) {
 }
 
 ExprNode* parse(const char* expression) {
-    Token tokens[100];
+    Token tokens[100]; // Max 100 tokens, adjust as needed
     int token_count = tokenize(expression, tokens);
     
     Parser parser = { tokens, token_count, 0 };
-    return parse_expression(&parser);
+    ExprNode* ast = parse_expression(&parser);
+
+    if (parser.pos < parser.count - 1) { // Check if there are unconsumed tokens before EOF
+        printf("Error: Unconsumed tokens at end of expression: '%s'. Check for syntax errors.\n", current_token(&parser).value);
+        exit(1);
+    }
+    return ast;
 }
 
 // --- Evaluation ---
 
 int evaluate(ExprNode* node, int a, int b, int c, int d) {
-    if (!node) return 0;
+    if (!node) return 0; // Should not happen with a valid AST
     
     switch (node->type) {
         case NODE_VARIABLE:
@@ -400,7 +431,7 @@ int evaluate(ExprNode* node, int a, int b, int c, int d) {
                 case 'c': return c;
                 case 'd': return d;
                 default:
-                    printf("Unknown variable: %c\n", node->var_name);
+                    printf("Error: Unknown variable: '%c'.\n", node->var_name);
                     exit(1);
             }
             
@@ -415,13 +446,18 @@ int evaluate(ExprNode* node, int a, int b, int c, int d) {
                 case OP_ADD: return left_val + right_val;
                 case OP_SUB: return subtract(left_val, right_val);
                 case OP_MUL: return multiply(left_val, right_val);
-                case OP_DIV: return divide_signed(left_val, right_val);
-                default: return 0;
+                case OP_DIV: 
+                    if (right_val == 0) {
+                        printf("Error: Division by zero.\n");
+                        exit(1);
+                    }
+                    return divide_signed(left_val, right_val);
+                default: return 0; // Should not be reached
             }
         }
         
         case NODE_FUNCTION: {
-            int args[3];
+            int args[3]; // Max 3 arguments
             for (int i = 0; i < node->function.argc; i++) {
                 args[i] = evaluate(node->function.args[i], a, b, c, d);
             }
@@ -436,14 +472,14 @@ int evaluate(ExprNode* node, int a, int b, int c, int d) {
                 case FUNC_GREATER_THAN: 
                     return greater_than(args[0], args[1]);
                 case FUNC_IFELSE: 
-                    return ifelse(args[0], args[1], args[2]);
+                    // Condition for ifelse should be a boolean (0 or 1 from equal/greater_than)
+                    return ifelse(args[0], args[1], args[2] != 0); 
                 case FUNC_ABSOLUTE: 
                     return absolute(args[0]);
-                default: return 0;
+                default: return 0; // Should not be reached
             }
         }
-        
-        default: return 0;
+        default: return 0; // Should not be reached
     }
 }
 
@@ -466,10 +502,30 @@ void free_tree(ExprNode* node) {
 
 // --- Main Program ---
 
+// Helper function to read an integer safely
+int read_int_input(const char* prompt) {
+    char buffer[100];
+    int value;
+    while (1) {
+        printf("%s", prompt);
+        if (fgets(buffer, sizeof(buffer), stdin) == NULL) {
+            printf("Error reading input. Exiting.\n");
+            exit(1);
+        }
+        // Attempt to parse the integer, allowing leading/trailing whitespace
+        if (sscanf(buffer, "%d", &value) == 1) {
+            return value;
+        } else {
+            printf("Invalid input. Please enter an integer.\n");
+        }
+    }
+}
+
+
 void print_usage() {
     printf("MPC Expression Interpreter\n");
-    printf("Available variables: a, b, c, d\n");
-    printf("Available functions: max, min, equal, greater_than, ifelse, absolute\n");
+    printf("Available variables: a, b, c, d (single character)\n");
+    printf("Available functions: max(x, y), min(x, y), equal(x, y), greater_than(x, y), ifelse(condition, true_val, false_val), absolute(x)\n");
     printf("Available operators: +, -, *, /\n");
     printf("Example: max(a * b, c + 5)\n");
     printf("Enter 'quit' to exit\n\n");
@@ -479,32 +535,43 @@ int main() {
     print_usage();
     
     char input[256];
-    int a = 0, b = 0, c = 0, d = 0;
+    int a, b, c, d;
     
-    // Get variable values
-    printf("Enter value for a: ");
-    scanf("%d", &a);
-    printf("Enter value for b: ");
-    scanf("%d", &b);
-    printf("Enter value for c: ");
-    scanf("%d", &c);
-    printf("Enter value for d: ");
-    scanf("%d", &d);
+    // Get variable values safely
+    a = read_int_input("Enter value for a: ");
+    b = read_int_input("Enter value for b: ");
+    c = read_int_input("Enter value for c: ");
+    d = read_int_input("Enter value for d: ");
     
     printf("\nVariables: a=%d, b=%d, c=%d, d=%d\n\n", a, b, c, d);
     
     while (1) {
         printf("Enter expression: ");
-        fgetc(stdin); // consume newline from previous scanf
-        if (fgets(input, sizeof(input), stdin) == NULL) break;
+        if (fgets(input, sizeof(input), stdin) == NULL) {
+            printf("Error reading input. Exiting.\n");
+            break;
+        }
         
-        // Remove newline if present
+        // Remove trailing newline character
         input[strcspn(input, "\n")] = 0;
         
-        if (strcmp(input, "quit") == 0) break;
+        if (strcmp(input, "quit") == 0) {
+            break;
+        }
         
-        ExprNode* ast = parse(input);
-        int result = evaluate(ast, a, b, c, d);
+        // Handle empty input line
+        if (input[0] == '\0') {
+            printf("Empty expression. Please enter a valid expression or 'quit'.\
+\n\n");
+            continue;
+        }
+
+        ExprNode* ast = NULL;
+        int result = 0;
+        
+        printf("Parsing and evaluating...\n");
+        ast = parse(input);
+        result = evaluate(ast, a, b, c, d);
         
         printf("Result: %d\n\n", result);
         
