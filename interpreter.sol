@@ -37,9 +37,23 @@ contract MPCExpressionEvaluator {
         return (a + mask) ^ mask;
     }
 
-    function subtract(int256 a, int256 b) private pure returns (int256) {
-        return a - b;
+    function subtract(int a, int b) private pure returns (int) {
+        uint ua = uint(a);
+        uint ub = uint(b);
+        uint result = 0;
+        uint borrow = 0;
+
+        for (uint i = 0; i < 32; i++) {
+            uint ai = (ua >> i) & 1;
+            uint bi = (ub >> i) & 1;
+            uint di = ai ^ bi ^ borrow;
+            result |= (di << i);
+            borrow = ((~ai & bi) | (~(ai ^ bi) & borrow)) & 1;
+        }
+
+        return int(result);
     }
+
 
     function multiply(int256 a, int256 b) private pure returns (int256) {
         if (a == 0 || b == 0) return 0;
